@@ -546,7 +546,8 @@ impl CloudSandboxClient {
         namespace: Option<String>,
         user_agent: Option<String>,
     ) -> PyResult<Self> {
-        let mut builder = ClientBuilder::new(&api_url);
+        let lifecycle_url = resolve_sandbox_lifecycle_url(&api_url);
+        let mut builder = ClientBuilder::new(&lifecycle_url);
         if let Some(token) = api_key.as_deref() {
             builder = builder.bearer_token(token);
         }
@@ -800,10 +801,12 @@ impl CloudSandboxClient {
         sandbox_id: String,
         routing_hint: Option<String>,
     ) -> PyResult<CloudSandboxProxyClient> {
-        let (base_url, host_override) = resolve_proxy_target(&proxy_url, &sandbox_id)?;
+        let (base_url, host_override, sandbox_id_header) =
+            resolve_proxy_target(&proxy_url, &sandbox_id)?;
         let shared_client = self.client.http_client().with_base_url(&base_url);
-        let proxy =
-            SandboxProxyClient::new(shared_client, host_override).with_routing_hint(routing_hint);
+        let proxy = SandboxProxyClient::new(shared_client, host_override)
+            .with_sandbox_id(sandbox_id_header)
+            .with_routing_hint(routing_hint);
         let runtime = Runtime::new().map_err(|e| {
             CloudSandboxClientError::new_err((
                 "internal",
@@ -863,7 +866,8 @@ impl CloudSandboxProxyClient {
         routing_hint: Option<String>,
         user_agent: Option<String>,
     ) -> PyResult<Self> {
-        let (base_url, host_override) = resolve_proxy_target(&proxy_url, &sandbox_id)?;
+        let (base_url, host_override, sandbox_id_header) =
+            resolve_proxy_target(&proxy_url, &sandbox_id)?;
 
         let mut builder = ClientBuilder::new(&base_url);
         if let Some(token) = api_key.as_deref() {
@@ -888,8 +892,9 @@ impl CloudSandboxProxyClient {
                 format!("failed to create tokio runtime: {e}"),
             ))
         })?;
-        let sandbox_proxy_client =
-            SandboxProxyClient::new(client, host_override).with_routing_hint(routing_hint);
+        let sandbox_proxy_client = SandboxProxyClient::new(client, host_override)
+            .with_sandbox_id(sandbox_id_header)
+            .with_routing_hint(routing_hint);
 
         Ok(Self {
             client: sandbox_proxy_client,
@@ -1159,7 +1164,8 @@ impl CloudSandboxDesktopClient {
         project_id: Option<String>,
         user_agent: Option<String>,
     ) -> PyResult<Self> {
-        let (base_url, host_override) = resolve_proxy_target(&proxy_url, &sandbox_id)?;
+        let (base_url, host_override, sandbox_id_header) =
+            resolve_proxy_target(&proxy_url, &sandbox_id)?;
 
         let mut builder = ClientBuilder::new(&base_url);
         if let Some(token) = api_key.as_deref() {
@@ -1189,6 +1195,7 @@ impl CloudSandboxDesktopClient {
             .block_on(RustSandboxDesktopClient::connect(
                 client,
                 host_override,
+                sandbox_id_header,
                 port,
                 password,
                 shared,
@@ -1808,7 +1815,15 @@ fn parse_json_payload<T: DeserializeOwned>(request_json: &str) -> PyResult<T> {
     })
 }
 
-fn resolve_proxy_target(proxy_url: &str, sandbox_id: &str) -> PyResult<(String, Option<String>)> {
+/// Resolve the proxy base URL and routing headers for a sandbox connection.
+///
+/// Returns `(base_url, host_override, sandbox_id_header)`:
+/// - localhost: `base_url` = proxy URL as-is; `host_override` = `{sandbox_id}.local`; no sandbox_id header
+/// - cloud: `base_url` = apex proxy domain (no sandbox subdomain); `sandbox_id_header` = sandbox_id for `X-Tensorlake-Sandbox-Id` header
+fn resolve_proxy_target(
+    proxy_url: &str,
+    sandbox_id: &str,
+) -> PyResult<(String, Option<String>, Option<String>)> {
     let parsed = reqwest::Url::parse(proxy_url).map_err(|error| {
         CloudSandboxClientError::new_err((
             "sdk_usage",
@@ -1828,12 +1843,14 @@ fn resolve_proxy_target(proxy_url: &str, sandbox_id: &str) -> PyResult<(String, 
         return Ok((
             proxy_url.trim_end_matches('/').to_string(),
             Some(format!("{sandbox_id}.local")),
+            None,
         ));
     }
 
+    // Cloud: use apex domain with X-Tensorlake-Sandbox-Id header for routing.
     let port = parsed.port().map(|p| format!(":{p}")).unwrap_or_default();
-    let base_url = format!("{}://{sandbox_id}.{host}{port}", parsed.scheme());
-    Ok((base_url, None))
+    let base_url = format!("{}://{host}{port}", parsed.scheme());
+    Ok((base_url, None, Some(sandbox_id.to_string())))
 }
 
 fn is_localhost_api_url(api_url: &str) -> bool {
@@ -1841,6 +1858,27 @@ fn is_localhost_api_url(api_url: &str) -> bool {
         .ok()
         .and_then(|url| url.host_str().map(ToString::to_string))
         .is_some_and(|host| host == "localhost" || host == "127.0.0.1")
+}
+
+fn resolve_sandbox_lifecycle_url(api_url: &str) -> String {
+    if is_localhost_api_url(api_url) {
+        return api_url.to_string();
+    }
+    if let Ok(mut parsed) = reqwest::Url::parse(api_url) {
+        if let Some(host) = parsed.host_str() {
+            if let Some(rest) = host.strip_prefix("api.") {
+                let new_host = format!("sandbox.{rest}");
+                if parsed.set_host(Some(&new_host)).is_ok() {
+                    let mut result = parsed.to_string();
+                    if result.ends_with('/') {
+                        result.pop();
+                    }
+                    return result;
+                }
+            }
+        }
+    }
+    "https://sandbox.tensorlake.ai".to_string()
 }
 
 /// Create a Docker build context tar.gz for a Tensorlake image definition.
